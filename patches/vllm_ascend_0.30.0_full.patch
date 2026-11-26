@@ -1,0 +1,961 @@
+--- a/vllm_ascend/cpu_binding.py
++++ b/vllm_ascend/cpu_binding.py
+@@ -197,7 +197,15 @@
+                     continue
+                 last_part = parts[-1]
+                 if self.is_cpu_list(last_part):
+-                    affinity[int(npu_match.group(1))] = self.expand_cpu_list(last_part)
++                    npu_id_str = npu_match.group(1)
++                    cpus = self.expand_cpu_list(last_part)
++                    chip_map = self.npu_map_info.get(npu_id_str)
++                    if chip_map:
++                        for logic_str in chip_map.values():
++                            if logic_str and logic_str.isdigit():
++                                affinity[int(logic_str)] = cpus
++                    else:
++                        affinity[int(npu_id_str)] = cpus
+         return affinity
+ 
+ 
+@@ -573,8 +581,19 @@
+             ]
+             if not base_cpu_list:
+                 raise RuntimeError("CPUs available in 'Cpus_allowed_list' conflict with NUMA affinity.")
+-            extra_cpu_list = self.extend_numa(base_cpu_list)
+-            self.npu_cpu_pool[npu] = extra_cpu_list
++            # HOST-4: when this NPU already has ample local-NUMA CPUs (e.g. single NPU with 24 cores
++            # on its own NUMA node), avoid extending into a remote NUMA node, which would pin
++            # acl_thread and release_thread onto remote NUMA cores.
++            same_affinity_npus = sum(
++                1
++                for other in candidate_npus
++                if self.device_info.npu_affinity.get(other) == self.device_info.npu_affinity.get(npu)
++            )
++            min_local_needed = max(self._min_cpus_per_npu(), 8) * max(1, same_affinity_npus)
++            if len(base_cpu_list) >= min_local_needed:
++                self.npu_cpu_pool[npu] = sorted(set(base_cpu_list))
++            else:
++                self.npu_cpu_pool[npu] = self.extend_numa(base_cpu_list)
+ 
+         groups = defaultdict(list)
+         for npu, cpus in self.npu_cpu_pool.items():
+--- a/vllm_ascend/device/device_op.py
++++ b/vllm_ascend/device/device_op.py
+@@ -887,19 +887,19 @@
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         """Run the A2/A3 Phase6 FLA NPU GDN prefill kernel."""
+         from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
+-
+-        q = l2norm_fwd(q.contiguous()).contiguous()
+-        k = l2norm_fwd(k.contiguous()).contiguous()
+-        v = v.contiguous()
++        q = q.transpose(1, 2).contiguous()
++        k = k.transpose(1, 2).contiguous()
++        v = v.transpose(1, 2).contiguous()
++        q = l2norm_fwd(q)
++        k = l2norm_fwd(k)  # Run L2Norm directly on contiguous BNSD layout (GDN-1)
++        
+         g = g.to(torch.float32).contiguous()
+         beta = beta.to(v.dtype).contiguous()
+         initial_state = initial_state.contiguous()
+ 
+         # BNSD/NTD take [B, H, T, D]; q/k/v arrive sequence-major. The output is
+         # still returned sequence-major, so only the inputs are permuted.
+-        q = q.transpose(1, 2).contiguous()
+-        k = k.transpose(1, 2).contiguous()
+-        v = v.transpose(1, 2).contiguous()
++       
+ 
+         cu_seqlens = prebuilt_meta.cu_seqlens_host
+         chunk_indices = prebuilt_meta.chunk_indices_chunk64_host
+--- a/vllm_ascend/ops/gdn.py
++++ b/vllm_ascend/ops/gdn.py
+@@ -15,6 +15,7 @@
+ # limitations under the License.
+ #
+ 
++import os
+ from functools import lru_cache, wraps
+ 
+ import torch
+@@ -53,6 +54,136 @@
+ 
+ _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
+ 
++# HOST-6 C++ GDN Core glue controls (enabled by default when _gdn_core_C is built).
++_GDN_CPP_GLUE_ENABLED = os.getenv("VLLM_ASCEND_GDN_CPP_GLUE", "1") != "0"
++_GDN_CPP_L2NORM_MODE = int(os.getenv("VLLM_ASCEND_GDN_CPP_L2NORM_MODE", "0"))
++_GDN_CPP_BF16_SIGMOID = os.getenv("VLLM_ASCEND_GDN_CPP_BF16_SIGMOID", "1") != "0"
++_GDN_CPP_CONTIG_IN_GRAPH = os.getenv("VLLM_ASCEND_GDN_CPP_CONTIG_IN_GRAPH", "1") != "0"
++_GDN_GATING_IN_GRAPH = os.getenv("VLLM_ASCEND_GDN_GATING_IN_GRAPH", "1") != "0"
++_GDN_SKIP_UNUSED_FINAL_STATE_MODE = int(os.getenv("VLLM_ASCEND_GDN_SKIP_UNUSED_FINAL_STATE", "1"))
++
++
++def _ascend_gdn_fused_gating_impl(
++    A_log: torch.Tensor,
++    a: torch.Tensor,
++    b: torch.Tensor,
++    dt_bias: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    g, beta = DeviceOperator.fused_gdn_gating(A_log, a, b, dt_bias)
++    return g.squeeze(0), beta.squeeze(0)
++
++
++def _ascend_gdn_fused_gating_fake(
++    A_log: torch.Tensor,
++    a: torch.Tensor,
++    b: torch.Tensor,
++    dt_bias: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    return (
++        torch.empty(a.shape, dtype=torch.float32, device=a.device),
++        torch.empty_like(b),
++    )
++
++
++def _ensure_gdn_fused_gating_op() -> None:
++    if not hasattr(torch.ops.vllm, "ascend_gdn_fused_gating"):
++        from vllm.utils.torch_utils import direct_register_custom_op
++
++        direct_register_custom_op(
++            op_name="ascend_gdn_fused_gating",
++            op_func=_ascend_gdn_fused_gating_impl,
++            mutates_args=[],
++            fake_impl=_ascend_gdn_fused_gating_fake,
++        )
++
++
++_ensure_gdn_fused_gating_op()
++
++_INV_SQRT_D_CACHE: dict[tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]] = {}
++
++
++def _get_inv_sqrt_d_tensors(device: torch.device, head_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
++    key = (device, head_dim)
++    cached = _INV_SQRT_D_CACHE.get(key)
++    if cached is None:
++        val = head_dim**-0.5
++        inv_fp32 = torch.full((head_dim,), val, device=device, dtype=torch.float32)
++        inv_bf16 = torch.full((head_dim,), val, device=device, dtype=torch.bfloat16)
++        cached = (inv_fp32, inv_bf16)
++        _INV_SQRT_D_CACHE[key] = cached
++    return cached
++
++
++@lru_cache(maxsize=1)
++def _get_gdn_cpp_core_ext():
++    if not _GDN_CPP_GLUE_ENABLED:
++        return None, False
++    try:
++        import vllm_ascend._gdn_core_C as gdn_core_ext
++        from fla_npu.ops.ascendc import _stable as fla_stable
++
++        fla_stable.load()
++        use_nowait = bool(fla_stable._enqueues_launch() and fla_stable._nowait_allowed())
++        return gdn_core_ext, use_nowait
++    except Exception:
++        return None, False
++
++
++def _get_cpp_prefill_state(layer: nn.Module):
++    """Lazily cache per-layer invariant tensors/scalars for HOST-6 C++ glue."""
++    a_log = layer.A_log
++    dt_bias = layer.dt_bias
++    base_conv = _get_base_conv1d(layer)
++    conv_w = base_conv.get_parameter(_PACKED_CONV_WEIGHT_NAME)
++    cache_key = (
++        a_log.data_ptr(),
++        a_log._version,
++        dt_bias.data_ptr(),
++        dt_bias._version,
++        conv_w.data_ptr(),
++        conv_w._version,
++    )
++    if getattr(layer, "_cpp_prefill_cache_key", None) != cache_key:
++        neg_exp_a_log_fp32 = (-torch.exp(a_log.detach().float())).contiguous()
++        dt_bias_fp32 = dt_bias.detach().float().contiguous()
++        inv_sqrt_d_fp32, inv_sqrt_d_bf16 = _get_inv_sqrt_d_tensors(a_log.device, layer.head_k_dim)
++        num_k_heads = layer.num_k_heads // layer.tp_size
++        num_v_heads = layer.num_v_heads // layer.tp_size
++        conv_head_num = 2 * num_k_heads + num_v_heads
++        activation_code = 1 if layer.activation else 0
++        scale = layer.head_k_dim**-0.5
++        layer._cpp_prefill_cache = (
++            neg_exp_a_log_fp32,
++            dt_bias_fp32,
++            conv_w,
++            base_conv.bias,
++            inv_sqrt_d_fp32,
++            inv_sqrt_d_bf16,
++            num_k_heads,
++            num_v_heads,
++            conv_head_num,
++            activation_code,
++            scale,
++        )
++        layer._cpp_prefill_cache_key = cache_key
++    return layer._cpp_prefill_cache
++
++
++def _can_use_cpp_prefill(layer: nn.Module) -> bool:
++    supported = getattr(layer, "_cpp_prefill_static_supported", None)
++    if supported is None:
++        supported = (
++            _GDN_CPP_GLUE_ENABLED
++            and layer.head_k_dim == layer.head_v_dim
++            and layer.head_k_dim % 16 == 0
++            and get_pcp_group().world_size == 1
++            and get_current_hardware_profile().supports(HardwareCapability.FLA_GDN_PREFILL)
++            and _get_fla_gdn_prefill_op() is not None
++            and _get_gdn_cpp_core_ext()[0] is not None
++        )
++        layer._cpp_prefill_static_supported = supported
++    return supported
++
+ 
+ @lru_cache(maxsize=1)
+ def _get_fla_gdn_prefill_op():
+@@ -394,6 +525,8 @@
+                 qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+                 z_size = self.value_dim // self.tp_size
+                 mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
++                if _GDN_CPP_GLUE_ENABLED and _GDN_CPP_CONTIG_IN_GRAPH:
++                    mixed_qkv = mixed_qkv.contiguous()
+                 z = z.reshape(z.size(0), -1, self.head_v_dim)
+                 ba, _ = self.in_proj_ba(hidden_states)
+                 b, a = self._split_ba_for_tp(ba)
+@@ -419,6 +552,13 @@
+         # ============================================================
+         # Note: we should not use torch.empty here like other attention backends,
+         # see discussions in https://github.com/vllm-project/vllm/pull/28182
++        if _GDN_GATING_IN_GRAPH and a.device.type != "cpu":
++            # GDN-5+: execute fused_gdn_gating inside Piecewise/FULL ACLGraph so
++            # replay incurs zero Eager Host dispatch while preserving 0.000e+00 accuracy.
++            a, b = torch.ops.vllm.ascend_gdn_fused_gating(
++                self.A_log, a, b, self.dt_bias
++            )
++
+         core_attn_out = torch.zeros(
+             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+             dtype=hidden_states.dtype,
+@@ -477,6 +617,78 @@
+         assert isinstance(attn_metadata, dict)
+         attn_metadata = attn_metadata[self.prefix]
+         assert isinstance(attn_metadata, GDNAttentionMetadata)
++
++        # HOST-6 fast path: single C++ glue call replaces per-layer Python & Triton dispatch.
++        if (
++            attn_metadata.spec_sequence_masks is None
++            and attn_metadata.num_prefills > 0
++            and attn_metadata.num_decodes == 0
++            and _can_use_cpp_prefill(self)
++            and mixed_qkv.device.type != "cpu"
++        ):
++            prefill_meta = attn_metadata.non_spec_prefill_metadata
++            chunk_meta = prefill_meta.chunk if prefill_meta is not None else None
++            if (
++                chunk_meta is not None
++                and chunk_meta.prefill_state_indices_cpu is not None
++                and chunk_meta.cu_seqlens_host_tensor is not None
++                and chunk_meta.chunk_indices_host_tensor is not None
++                and chunk_meta.conv1d_cache_indices_contig is not None
++            ):
++                cpp_ext, use_nowait_stream = _get_gdn_cpp_core_ext()
++                (
++                    neg_exp_a_log_fp32,
++                    dt_bias_fp32,
++                    conv_w,
++                    conv_bias,
++                    inv_sqrt_d_fp32,
++                    inv_sqrt_d_bf16,
++                    num_k_heads,
++                    num_v_heads,
++                    conv_head_num,
++                    activation_code,
++                    scale,
++                ) = _get_cpp_prefill_state(self)
++                conv_meta = prefill_meta.causal_conv1d
++                cpp_ext.gdn_prefill_core(
++                    mixed_qkv,
++                    b,
++                    a,
++                    core_attn_out,
++                    conv_w,
++                    conv_bias,
++                    self.kv_cache[0],
++                    self.kv_cache[1],
++                    neg_exp_a_log_fp32,
++                    dt_bias_fp32,
++                    inv_sqrt_d_fp32,
++                    inv_sqrt_d_bf16,
++                    conv_meta.query_start_loc,
++                    chunk_meta.conv1d_cache_indices_contig,
++                    conv_meta.initial_state_mode,
++                    chunk_meta.prefill_state_indices_cpu,
++                    chunk_meta.prefill_has_initial_state_cpu,
++                    chunk_meta.cu_seqlens_host_tensor,
++                    chunk_meta.chunk_indices_host_tensor,
++                    chunk_meta.keep_mask_cpu,
++                    attn_metadata.num_actual_tokens,
++                    num_k_heads,
++                    num_v_heads,
++                    conv_head_num,
++                    activation_code,
++                    PAD_SLOT_ID,
++                    0,
++                    scale,
++                    chunk_meta.prefill_has_any_initial_state,
++                    chunk_meta.prefill_output_final_state if _GDN_SKIP_UNUSED_FINAL_STATE_MODE >= 2 else True,
++                    use_nowait_stream,
++                    _GDN_CPP_L2NORM_MODE,
++                    _GDN_CPP_BF16_SIGMOID,
++                    a.dtype == torch.float32,
++                    chunk_meta.prefill_output_final_state if _GDN_SKIP_UNUSED_FINAL_STATE_MODE >= 1 else True,
++                )
++                maybe_save_kv_layer_to_connector("", [])
++                return
+         spec_sequence_masks = attn_metadata.spec_sequence_masks
+         spec_token_indx = attn_metadata.spec_token_indx
+         non_spec_token_indx = attn_metadata.non_spec_token_indx
+@@ -677,7 +889,11 @@
+             query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
+ 
+         # 2. Recurrent attention
+-        g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
++        if a.dtype == torch.float32:
++            g = a.unsqueeze(0)
++            beta = b.unsqueeze(0)
++        else:
++            g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+         if spec_sequence_masks is not None:
+             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
+                 g_spec = g
+--- a/vllm_ascend/ops/gdn_attn_builder.py
++++ b/vllm_ascend/ops/gdn_attn_builder.py
+@@ -1,3 +1,5 @@
++from copy import copy as _shallow_copy
++from typing import Any
+ # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+ # This file is a part of the vllm-ascend project.
+ #
+@@ -128,6 +130,14 @@
+     num_decodes: int = 0
+     cu_seqlens_kern: tuple[int, ...] | None = None
+     keep_meta: torch.Tensor | None = None
++    cu_seqlens_host_tensor: torch.Tensor | None = None
++    chunk_indices_host_tensor: torch.Tensor | None = None
++    keep_mask_cpu: torch.Tensor | None = None
++    prefill_state_indices_cpu: torch.Tensor | None = None
++    prefill_has_initial_state_cpu: torch.Tensor | None = None
++    prefill_has_any_initial_state: bool = True
++    prefill_output_final_state: bool = True
++    conv1d_cache_indices_contig: torch.Tensor | None = None
+ 
+ 
+ @dataclass
+@@ -297,14 +307,23 @@
+         )
+         block_indices_cumsum = prepare_chunk_indices(cu_seqlens_cpu, cumsum_chunk_size)
+ 
+-    cu_seqlens_host = tuple(cu_seqlens_cpu.to(torch.int64).reshape(-1).tolist())
++    cu_seqlens_i64 = cu_seqlens_cpu.to(torch.int64).reshape(-1).contiguous()
++    cu_seqlens_host = tuple(cu_seqlens_i64.tolist())
+     # Pre-compute compact cu_seqlens for AscendC kernels so each layer
+     # can reuse them instead of calling _compact_empty_segments again.
+-    cu_seqlens_kern, _, keep_meta = _compact_empty_segments(cu_seqlens_host, None, device=device)
+-    if keep_meta is None:
++    keep_cpu = (cu_seqlens_i64[1:] - cu_seqlens_i64[:-1]) > 0
++    if bool(keep_cpu.all()):
+         cu_seqlens_kern = None
++        keep_meta = None
++        keep_mask_cpu = None
++        cu_seqlens_host_tensor = cu_seqlens_i64
+     else:
+-        cu_seqlens_kern = tuple(cu_seqlens_kern)
++        cu_kern_t = torch.cat([cu_seqlens_i64[:1], cu_seqlens_i64[1:][keep_cpu]]).contiguous()
++        cu_seqlens_kern = tuple(cu_kern_t.tolist())
++        keep_mask_cpu = keep_cpu.contiguous()
++        keep_meta = keep_mask_cpu.to(device)
++        cu_seqlens_host_tensor = cu_kern_t
++    chunk_indices_host_tensor = chunk_indices_chunk64.to(torch.int64).reshape(-1).contiguous()
+ 
+     if build_device_metadata:
+         device_chunk_metadata = {
+@@ -327,16 +346,21 @@
+ 
+     return GDNChunkedPrefillMetadata(
+         cu_seqlens_host=cu_seqlens_host,
+-        chunk_indices_chunk64_host=tuple(chunk_indices_chunk64.to(torch.int64).reshape(-1).tolist()),
++        chunk_indices_chunk64_host=tuple(chunk_indices_host_tensor.tolist()),
+         **device_chunk_metadata,
+         cu_seqlens_kern=cu_seqlens_kern,
+         keep_meta=keep_meta,
++        cu_seqlens_host_tensor=cu_seqlens_host_tensor,
++        chunk_indices_host_tensor=chunk_indices_host_tensor,
++        keep_mask_cpu=keep_mask_cpu,
+     )
+ 
+ 
+ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
+     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+     build_device_chunk_metadata = True
++    _accepts_block_table_cpu = True
++    _accepts_shared_gdn_cache = True
+ 
+     def __init__(
+         self,
+@@ -674,6 +698,9 @@
+         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
+         fast_build: bool = False,
+         num_actual_reqs: int | None = None,
++        block_table_cpu: torch.Tensor | None = None,
++        prefill_output_final_state: bool = True,
++        shared_gdn_step_cache: dict[Any, Any] | None = None,
+     ) -> GDNAttentionMetadata:
+         # Normalize FIA's full-width dummy queries before slicing requests:
+         # its common token count may still include those inactive rows.
+@@ -703,12 +730,62 @@
+ 
+         query_start_loc = m.query_start_loc
+         query_start_loc_cpu = m.query_start_loc_cpu
+-        block_table_tensor = mamba_get_block_table_tensor(
+-            m.block_table_tensor,
+-            m.seq_lens,
+-            self.kv_cache_spec,
+-            self.vllm_config.cache_config.mamba_cache_mode,
+-        )
++        mamba_cache_mode = self.vllm_config.cache_config.mamba_cache_mode
++        _precomputed_state_indices_cpu: torch.Tensor | None = None
++        _can_cpu_align = (
++            mamba_cache_mode == "align"
++            and self.kv_cache_spec.num_speculative_blocks == 0
++            and not self.use_spec_decode
++            and block_table_cpu is not None
++            and m.seq_lens_cpu is not None
++            and m.num_reqs > 0
++            and block_table_cpu.size(0) >= m.num_reqs
++        )
++        if _can_cpu_align:
++            # HOST-5b: compute align start_indices once on CPU (shared across the 3 GDN
++            # KV groups) and gather per-group block ids on CPU + tiny pinned H2D copy,
++            # eliminating 3x (Sub + FloorDiv + Clamp + Arange + Cast + Gather) NPU kernels.
++            _cache_key_idx = (m.num_reqs, self.kv_cache_spec.block_size)
++            _start_idx_cpu = (
++                shared_gdn_step_cache.get(("start_indices_cpu", _cache_key_idx))
++                if shared_gdn_step_cache is not None
++                else None
++            )
++            if _start_idx_cpu is None:
++                _seq_cpu = m.seq_lens_cpu[: m.num_reqs]
++                _start_idx_cpu = (
++                    ((_seq_cpu - 1) // self.kv_cache_spec.block_size)
++                    .clamp(min=0)
++                    .to(torch.int64)
++                    .unsqueeze(1)
++                )
++                if shared_gdn_step_cache is not None:
++                    shared_gdn_step_cache[("start_indices_cpu", _cache_key_idx)] = _start_idx_cpu
++            _bt_i32_cpu = block_table_cpu[: m.num_reqs].gather(1, _start_idx_cpu)
++            _precomputed_state_indices_cpu = _bt_i32_cpu.squeeze(1).to(torch.int64).contiguous()
++            _n = m.num_reqs
++            _dev = m.block_table_tensor.device
++            _gpu_buf = getattr(self, "_align_bt_gpu_buf", None)
++            if _gpu_buf is None or _gpu_buf.size(0) < _n or _gpu_buf.device != _dev:
++                _cap = max(_n, self.vllm_config.scheduler_config.max_num_seqs)
++                _gpu_buf = torch.empty((_cap, 1), dtype=m.block_table_tensor.dtype, device=_dev)
++                _cpu_buf = torch.empty(
++                    (_cap, 1),
++                    dtype=m.block_table_tensor.dtype,
++                    pin_memory=(_dev.type != "cpu"),
++                )
++                self._align_bt_gpu_buf = _gpu_buf
++                self._align_bt_cpu_buf = _cpu_buf
++            self._align_bt_cpu_buf[:_n].copy_(_bt_i32_cpu)
++            block_table_tensor = self._align_bt_gpu_buf[:_n]
++            block_table_tensor.copy_(self._align_bt_cpu_buf[:_n], non_blocking=True)
++        else:
++            block_table_tensor = mamba_get_block_table_tensor(
++                m.block_table_tensor,
++                m.seq_lens,
++                self.kv_cache_spec,
++                mamba_cache_mode,
++            )
+ 
+         spec_sequence_masks_cpu: torch.Tensor | None = None
+         spec_sequence_indices: torch.Tensor | None = None
+@@ -744,11 +821,27 @@
+                 )
+ 
+         if spec_sequence_masks is None:
+-            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
+-                m,
+-                decode_threshold=1,
+-                treat_short_extends_as_decodes=False,
++            _split_key = ("split", m.num_reqs, m.num_actual_tokens)
++            _cached_split = (
++                shared_gdn_step_cache.get(_split_key)
++                if shared_gdn_step_cache is not None
++                else None
+             )
++            if _cached_split is not None:
++                num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = _cached_split
++            else:
++                num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
++                    m,
++                    decode_threshold=1,
++                    treat_short_extends_as_decodes=False,
++                )
++                if shared_gdn_step_cache is not None:
++                    shared_gdn_step_cache[_split_key] = (
++                        num_decodes,
++                        num_prefills,
++                        num_decode_tokens,
++                        num_prefill_tokens,
++                    )
+             num_spec_decode_tokens = 0
+             spec_token_indx = None
+             non_spec_token_indx = None
+@@ -902,21 +995,54 @@
+ 
+             assert prefill_query_start_loc_cpu is not None
+             if self._USE_COMMON_KERNEL_METADATA:
+-                non_spec_chunked_prefill_metadata = _build_non_spec_chunked_prefill_metadata(
+-                    self,
+-                    prefill_query_start_loc_cpu,
+-                    query_start_loc.device,
+-                    build_device_metadata=self.build_device_chunk_metadata,
++                _chunk_key = (
++                    "chunk_meta",
++                    num_prefills,
++                    num_decodes,
++                    m.num_actual_tokens,
++                    self.build_device_chunk_metadata,
++                )
++                _base_chunk = (
++                    shared_gdn_step_cache.get(_chunk_key)
++                    if (shared_gdn_step_cache is not None and spec_sequence_masks is None)
++                    else None
+                 )
++                if _base_chunk is None:
++                    _base_chunk = _build_non_spec_chunked_prefill_metadata(
++                        self,
++                        prefill_query_start_loc_cpu,
++                        query_start_loc.device,
++                        build_device_metadata=self.build_device_chunk_metadata,
++                    )
++                    if shared_gdn_step_cache is not None and spec_sequence_masks is None:
++                        shared_gdn_step_cache[_chunk_key] = _base_chunk
++                non_spec_chunked_prefill_metadata = _shallow_copy(_base_chunk)
+                 # Common GDN/KDA callers also consume the upstream chunk fields.
+                 chunk_indices = non_spec_chunked_prefill_metadata.chunk_indices_chunk64
+                 chunk_offsets = non_spec_chunked_prefill_metadata.chunk_offsets_chunk64
+ 
++        _shared_has_init_cpu: torch.Tensor | None = None
+         if num_prefills > 0:
+-            has_initial_state = self._build_prefill_has_initial_state(
+-                context_lens_tensor=m.compute_num_computed_tokens(),
+-                non_spec_sequence_indices=non_spec_sequence_indices,
++            _hi_key = ("has_init", m.num_reqs, num_decodes, m.num_actual_tokens)
++            _cached_hi = (
++                shared_gdn_step_cache.get(_hi_key)
++                if (shared_gdn_step_cache is not None and spec_sequence_masks is None)
++                else None
+             )
++            if _cached_hi is not None:
++                has_initial_state, _shared_has_init_cpu = _cached_hi
++            elif spec_sequence_masks is None and m.seq_lens_cpu is not None and m.num_reqs > 0:
++                _seq_cpu = m.seq_lens_cpu[: m.num_reqs]
++                _qlens_cpu = m.query_start_loc_cpu[1:] - m.query_start_loc_cpu[:-1]
++                _shared_has_init_cpu = ((_seq_cpu - _qlens_cpu[: m.num_reqs]) > 0).to(torch.bool).contiguous()
++                has_initial_state = _shared_has_init_cpu.to(query_start_loc.device, non_blocking=True)
++                if shared_gdn_step_cache is not None:
++                    shared_gdn_step_cache[_hi_key] = (has_initial_state, _shared_has_init_cpu)
++            else:
++                has_initial_state = self._build_prefill_has_initial_state(
++                    context_lens_tensor=m.compute_num_computed_tokens(),
++                    non_spec_sequence_indices=non_spec_sequence_indices,
++                )
+             if spec_sequence_masks is None and num_decodes > 0:
+                 prefill_has_initial_state = has_initial_state[num_decodes:]
+             else:
+@@ -966,6 +1092,69 @@
+         ):
+             self._pad_decode_metadata(attn_metadata, graph_request_count)
+             non_spec_conv1d_cache_indices = attn_metadata.non_spec_state_indices_tensor
++        # Populate zero-sync CPU metadata once per step for the HOST-6 C++ GDN glue.
++        if (
++            num_prefills > 0
++            and spec_sequence_masks is None
++            and non_spec_chunked_prefill_metadata is not None
++        ):
++            if non_spec_conv1d_cache_indices is not None:
++                conv_cidx = non_spec_conv1d_cache_indices
++                if conv_cidx.dim() == 1:
++                    conv_cidx_1d = conv_cidx.contiguous()
++                elif conv_cidx.dim() == 2:
++                    conv_cidx_1d = conv_cidx[:, 0].contiguous()
++                else:
++                    conv_cidx_1d = None
++                non_spec_chunked_prefill_metadata.conv1d_cache_indices_contig = conv_cidx_1d
++            if (
++                block_table_cpu is not None
++                and m.seq_lens_cpu_upper_bound is not None
++                and m.num_reqs > 0
++                and block_table_cpu.size(0) >= m.num_reqs
++            ):
++                if _precomputed_state_indices_cpu is not None:
++                    state_indices_cpu = _precomputed_state_indices_cpu
++                else:
++                    bt_cpu = block_table_cpu[: m.num_reqs]
++                    seq_lens_cpu = m.seq_lens_cpu_upper_bound[: m.num_reqs]
++                    if mamba_cache_mode in ("all", "none"):
++                        state_indices_cpu = bt_cpu[:, 0].to(torch.int64).contiguous()
++                    else:
++                        start_indices_cpu = (
++                            ((seq_lens_cpu - 1) // self.kv_cache_spec.block_size)
++                            .clamp(min=0)
++                            .to(torch.int64)
++                        )
++                        state_indices_cpu = (
++                            bt_cpu.gather(1, start_indices_cpu.unsqueeze(1))
++                            .squeeze(1)
++                            .to(torch.int64)
++                            .contiguous()
++                        )
++                if _shared_has_init_cpu is not None:
++                    has_init_cpu = _shared_has_init_cpu
++                else:
++                    seq_lens_cpu = m.seq_lens_cpu_upper_bound[: m.num_reqs]
++                    query_lens_cpu = m.query_start_loc_cpu[1:] - m.query_start_loc_cpu[:-1]
++                    num_computed_cpu = seq_lens_cpu - query_lens_cpu[: m.num_reqs]
++                    has_init_cpu = (num_computed_cpu > 0).to(torch.bool).contiguous()
++                if num_decodes > 0:
++                    prefill_st_cpu = state_indices_cpu[num_decodes:].contiguous()
++                    prefill_hi_cpu = has_init_cpu[num_decodes:].contiguous()
++                else:
++                    prefill_st_cpu = state_indices_cpu
++                    prefill_hi_cpu = has_init_cpu
++                if prefill_st_cpu.numel() == num_prefills:
++                    non_spec_chunked_prefill_metadata.prefill_state_indices_cpu = prefill_st_cpu
++                    non_spec_chunked_prefill_metadata.prefill_has_initial_state_cpu = prefill_hi_cpu
++                    non_spec_chunked_prefill_metadata.prefill_has_any_initial_state = bool(
++                        prefill_hi_cpu.any().item()
++                    )
++                    non_spec_chunked_prefill_metadata.prefill_output_final_state = (
++                        prefill_output_final_state
++                    )
++
+         # Attach once, using the final graph-stable Tensor references.
+         self._attach_non_spec_prefill_metadata(
+             attn_metadata, non_spec_chunked_prefill_metadata, non_spec_conv1d_cache_indices
+--- a/vllm_ascend/patch/worker/patch_qwen3_5.py
++++ b/vllm_ascend/patch/worker/patch_qwen3_5.py
+@@ -17,15 +17,20 @@
+ # mypy: ignore-errors
+ 
+ 
++import os
+ from functools import wraps
++from itertools import islice
+ 
+ import torch
+ from vllm.config import VllmConfig
+ from vllm.distributed import tensor_model_parallel_all_gather
+ from vllm.distributed.parallel_state import get_pp_group
+ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention as _GDNBaseCls
+-from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
++from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5Model
+ from vllm.model_executor.models.qwen3_next import Qwen3NextAttention, Qwen3NextSparseMoeBlock
++from vllm.model_executor.models.utils import sequence_parallel_chunk
++
++_SHARE_MROPE_COS_SIN = os.getenv("VLLM_ASCEND_SHARE_MROPE_COS_SIN", "1") != "0"
+ 
+ try:
+     from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MultiTokenPredictor
+@@ -49,13 +54,20 @@
+ 
+ 
+ class AscendQwen3NextAttention(Qwen3NextAttention):
+-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, output: torch.Tensor = None):
++    def forward(
++        self,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++        output: torch.Tensor = None,
++        cos_sin: torch.Tensor | None = None,
++    ):
+         qkv, _ = self.qkv_proj(hidden_states)
+         if _uses_multimodal_rope(self):
+-            # MRV2 MTP uses 1D text positions; the fused kernel reads three planes.
+-            if positions.ndim == 1:
+-                positions = positions.unsqueeze(0).expand(3, -1)
+-            cos_sin = self.rotary_emb.cos_sin_cache[positions]
++            if cos_sin is None:
++                # MRV2 MTP uses 1D text positions; the fused kernel reads three planes.
++                if positions.ndim == 1:
++                    positions = positions.unsqueeze(0).expand(3, -1)
++                cos_sin = self.rotary_emb.cos_sin_cache[positions]
+             if cos_sin.device != qkv.device:
+                 cos_sin = cos_sin.to(qkv.device)
+             if cos_sin.dtype != qkv.dtype:
+@@ -137,6 +149,7 @@
+         hidden_states: torch.Tensor,
+         residual: torch.Tensor | None,
+         positions: torch.Tensor = None,
++        cos_sin: torch.Tensor | None = None,
+         **kwargs: object,
+     ):
+         use_sp = getattr(self, "use_attn_reduce_scatter_for_moe", False)
+@@ -160,6 +173,7 @@
+             hidden_states = self.self_attn(
+                 hidden_states=hidden_states,
+                 positions=positions,
++                cos_sin=cos_sin,
+             )
+         else:
+             raise ValueError("Invalid layer_type")
+@@ -284,6 +298,99 @@
+ Qwen3NextAttention.forward = AscendQwen3NextAttention.forward
+ # Sequence-parallel decoder layout (upstream SP-MoE contract plus the dense
+ # Qwen3.5-family FlashComm SP extension) and the dense-SP layer wiring.
++_QWEN3_5_MODEL_ORIGINAL_INIT = Qwen3_5Model.__init__
++
++
++def _qwen3_5_model_init_with_shared_mrope(self, *args, **kwargs) -> None:
++    _QWEN3_5_MODEL_ORIGINAL_INIT(self, *args, **kwargs)
++    shared_rope = None
++    can_share = _SHARE_MROPE_COS_SIN
++    if can_share:
++        for layer in islice(self.layers, self.start_layer, self.end_layer):
++            if getattr(layer, "layer_type", None) == "full_attention":
++                attn = layer.self_attn
++                if not _uses_multimodal_rope(attn):
++                    can_share = False
++                    break
++                if shared_rope is None:
++                    shared_rope = attn.rotary_emb
++                elif attn.rotary_emb.cos_sin_cache is not shared_rope.cos_sin_cache:
++                    can_share = False
++                    break
++    self._shared_mrope_rotary_emb = shared_rope if can_share else None
++
++
++def _qwen3_5_model_forward_shared_mrope(
++    self,
++    input_ids: torch.Tensor | None,
++    positions: torch.Tensor,
++    intermediate_tensors=None,
++    inputs_embeds: torch.Tensor | None = None,
++):
++    if get_pp_group().is_first_rank:
++        if inputs_embeds is not None:
++            hidden_states = inputs_embeds
++        else:
++            hidden_states = self.embed_input_ids(input_ids)
++        residual = None
++    else:
++        assert intermediate_tensors is not None
++        hidden_states = intermediate_tensors["hidden_states"]
++        residual = intermediate_tensors["residual"]
++
++    full_num_tokens = positions.shape[-1]
++    if self.use_sequence_parallel:
++        hidden_states = sequence_parallel_chunk(hidden_states)
++        assert residual is None
++
++    # HOST-5a: gather mrope cos_sin_cache[positions] once per forward and reuse across all 8 Full-Attn layers.
++    shared_cos_sin = None
++    shared_rope = getattr(self, "_shared_mrope_rotary_emb", None)
++    if shared_rope is not None:
++        pos_3d = positions.unsqueeze(0).expand(3, -1) if positions.ndim == 1 else positions
++        shared_cos_sin = shared_rope.cos_sin_cache[pos_3d]
++        if shared_cos_sin.device != hidden_states.device:
++            shared_cos_sin = shared_cos_sin.to(hidden_states.device)
++        if shared_cos_sin.dtype != hidden_states.dtype:
++            shared_cos_sin = shared_cos_sin.to(hidden_states.dtype)
++
++    aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
++    for layer_idx, layer in enumerate(
++        islice(self.layers, self.start_layer, self.end_layer),
++        start=self.start_layer,
++    ):
++        hidden_states, residual = layer(
++            positions=positions,
++            hidden_states=hidden_states,
++            residual=residual,
++            cos_sin=shared_cos_sin,
++        )
++        self._maybe_add_hidden_state(
++            aux_hidden_states, layer_idx + 1, hidden_states, residual
++        )
++
++    if not get_pp_group().is_last_rank:
++        return IntermediateTensors(
++            {"hidden_states": hidden_states, "residual": residual}
++        )
++    hidden_states, _ = self.norm(hidden_states, residual)
++    if self.use_sequence_parallel:
++        if aux_hidden_states:
++            hidden_size = hidden_states.shape[-1]
++            hidden_states = torch.cat([hidden_states, *aux_hidden_states], dim=-1)
++            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
++            hidden_states = hidden_states[:full_num_tokens]
++            hidden_states, *aux_hidden_states = hidden_states.split(hidden_size, dim=-1)
++        else:
++            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
++            hidden_states = hidden_states[:full_num_tokens]
++    if aux_hidden_states:
++        return hidden_states, aux_hidden_states
++    return hidden_states
++
++
++Qwen3_5Model.__init__ = _qwen3_5_model_init_with_shared_mrope
++Qwen3_5Model.forward = _qwen3_5_model_forward_shared_mrope
+ Qwen3_5DecoderLayer.__init__ = _qwen3_5_decoder_layer_init_with_dense_sp
+ Qwen3_5DecoderLayer.forward = AscendQwen3_5DecoderLayer.forward
+ _GDN_PATCH_TARGET._split_ba_for_tp = AscendGatedDeltaNetAttention._split_ba_for_tp
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -1,3 +1,4 @@
++import os
+ #
+ # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+ # Copyright 2025 The vLLM team.
+@@ -1432,6 +1433,7 @@
+ 
+         self.query_start_loc.np[0] = 0
+         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
++        self.query_start_loc.np[num_reqs + 1 :].fill(-1)
+         self.query_start_loc.copy_to_gpu()
+ 
+         # Now, query_start_loc is padded.
+@@ -1456,8 +1458,7 @@
+         )
+         self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+ 
+-        # Fill unused with -1. Needed for reshape_and_cache in attention_cp
+-        self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
++        # Unused tail of query_start_loc was already filled with -1 on CPU before copy_to_gpu.
+ 
+         # Copy the tensors to the NPU.
+         self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
+@@ -1481,8 +1482,9 @@
+ 
+         discard_request_indices = np.nonzero(discard_requests_mask)[0]
+         self.num_discarded_requests = len(discard_request_indices)
+-        self.discard_request_indices.np[: self.num_discarded_requests] = discard_request_indices
+-        self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
++        if self.num_discarded_requests > 0:
++            self.discard_request_indices.np[: self.num_discarded_requests] = discard_request_indices
++            self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
+ 
+         self.discard_request_mask.np[:num_reqs] = discard_requests_mask
+         self.discard_request_mask.copy_to_gpu(num_reqs)
+@@ -1497,8 +1499,13 @@
+             self.num_accepted_tokens.np[num_reqs:].fill(1)
+             self.num_accepted_tokens.copy_to_gpu()
+         else:
+-            self.num_accepted_tokens.np.fill(1)
+-            self.num_accepted_tokens.gpu.fill_(1)
++            if self.speculative_config is not None or not getattr(
++                self, "_num_accepted_tokens_initialized_ones", False
++            ):
++                self.num_accepted_tokens.np.fill(1)
++                self.num_accepted_tokens.gpu.fill_(1)
++                if self.speculative_config is None:
++                    self._num_accepted_tokens_initialized_ones = True
+ 
+         # Update num_computed_tokens on GPU. In async spec decode,
+         # CPU values are optimistic (all drafts accepted). The kernel
+@@ -3583,8 +3590,10 @@
+                 blk_table_tensor = blk_table.get_device_tensor()[:num_reqs_padded]
+                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
+                 # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
+-                slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
+-                blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
++                if num_tokens < num_tokens_padded:
++                    slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
++                if num_reqs < num_reqs_padded:
++                    blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
+             return blk_table_tensor, slot_mapping
+ 
+         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
+@@ -3765,6 +3774,19 @@
+             if isinstance(builder, GDNAttentionMetadataBuilder) and not is_gdn_noop:
+                 assert ubid is None, "UBatching not supported with GDN yet"
+                 extra_attn_metadata_args["num_actual_reqs"] = num_reqs
++                if (
++                    getattr(builder, "_accepts_block_table_cpu", False)
++                    and not isinstance(
++                        kv_cache_groups[kv_cache_gid].kv_cache_spec,
++                        EncoderOnlyAttentionSpec,
++                    )
++                ):
++                    extra_attn_metadata_args["block_table_cpu"] = (
++                        self.input_batch.block_table[kv_cache_gid].get_cpu_tensor()[:num_reqs]
++                    )
++                if getattr(builder, "_accepts_shared_gdn_cache", False):
++                    extra_attn_metadata_args["prefill_output_final_state"] = gdn_prefill_output_final_state
++                    extra_attn_metadata_args["shared_gdn_step_cache"] = shared_gdn_step_cache
+                 if use_spec_decode:
+                     extra_attn_metadata_args.update(
+                         num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
+@@ -3821,6 +3843,58 @@
+         # in the same group share the same metadata.
+         common_ratio_to_sas_metadata: dict[Any, Any] = {}
+         common_v41_batch_metadata: dict[str, Any] = {}
++        shared_gdn_step_cache: dict[Any, Any] = {}
++        # GDN-4: determine once per step whether any prefill request needs final_state
++        # saved (for subsequent decode, multi-chunk prefill, or Mamba prefix cache boundary).
++        gdn_prefill_output_final_state = True
++        if (
++            self._has_gdn
++            and not for_cudagraph_capture
++            and not skip_gdn_state_update
++            and not use_spec_decode
++            and self.vllm_config.kv_transfer_config is None
++            and num_reqs > 0
++            and os.getenv("VLLM_ASCEND_GDN_SKIP_UNUSED_FINAL_STATE", "1") != "0"
++        ):
++            _mamba_spec = None
++            for _grp in kv_cache_groups:
++                if isinstance(_grp.kv_cache_spec, MambaSpec):
++                    _mamba_spec = _grp.kv_cache_spec
++                    break
++            if _mamba_spec is not None and _mamba_spec.num_prefill_checkpoint_blocks == 0:
++                _mamba_bs = _mamba_spec.block_size
++                _enable_pc = bool(self.cache_config.enable_prefix_caching)
++                _mamba_mode = self.cache_config.mamba_cache_mode
++                _hash_bs = (
++                    self.cache_config.prefix_match_unit
++                    if self.cache_config.prefix_match_unit is not None
++                    else _mamba_bs
++                )
++                _can_skip_fs = True
++                _req_ids = self.input_batch.req_ids
++                _opt_sl = self.optimistic_seq_lens_cpu
++                _num_comp = self.input_batch.num_computed_tokens_cpu
++                if len(_req_ids) < num_reqs:
++                    _can_skip_fs = False
++                for _i in range(num_reqs if _can_skip_fs else 0):
++                    _rs = self.requests.get(_req_ids[_i])
++                    if _rs is None or _rs.sampling_params is None or _rs.sampling_params.max_tokens != 1:
++                        _can_skip_fs = False
++                        break
++                    _sl = int(_opt_sl[_i].item())
++                    if _sl < _rs.num_prompt_tokens:
++                        _can_skip_fs = False
++                        break
++                    if _enable_pc and _mamba_mode != "none":
++                        if _mamba_mode != "align":
++                            _can_skip_fs = False
++                            break
++                        _prev_c = int(_num_comp[_i])
++                        if (_sl // _mamba_bs > _prev_c // _mamba_bs) or (_sl % _hash_bs == 0):
++                            _can_skip_fs = False
++                            break
++                if _can_skip_fs:
++                    gdn_prefill_output_final_state = False
+         spec_decode_common_attn_metadata = None
+         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+             # V4.1 cache coordinates are shared only inside one framework KV

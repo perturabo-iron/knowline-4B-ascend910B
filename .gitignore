@@ -1,0 +1,25 @@
+# Virtual environment & build artifacts
+venv/
+.build_wheels/
+wheels/
+logs/
+*.pid
+*.log
+
+# Python & C++ compiled artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.o
+*.a
+build/
+dist/
+*.egg-info/
+
+# Editor / OS / backup clutter
+.DS_Store
+*.bak*
+*.orig
+*.rej
+*~

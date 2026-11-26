@@ -1,0 +1,514 @@
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -1,3 +1,4 @@
++import os
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """A layer that compute logits from hidden_stats."""
+@@ -155,10 +156,17 @@
+                 "A head_dtype different from the model dtype is only "
+                 "supported for an unquantized lm_head."
+             )
+-        if (
+-            self.head_dtype == torch.float32
+-            and (current_platform.is_cuda() or current_platform.is_rocm())
+-            and hidden_states.is_cuda
++        if self.head_dtype == torch.float32 and (
++            (
++                (current_platform.is_cuda() or current_platform.is_rocm())
++                and hidden_states.is_cuda
++            )
++            or (
++                hidden_states.device.type == "npu"
++                and os.getenv("VLLM_ASCEND_FP32_HEAD_MM", "1") != "0"
++                and hidden_states.dtype == lm_head.weight.dtype
++                and lm_head.weight.dtype in (torch.bfloat16, torch.float16)
++            )
+         ):
+             # Accumulate the projection directly into fp32. This avoids
+             # materializing an fp32 copy of the lm_head weight on every step,
+@@ -171,10 +179,33 @@
+             if embedding_bias is not None:
+                 logits = logits + embedding_bias.to(self.head_dtype)
+             return logits.reshape(*hidden_states.shape[:-1], -1)
++        weight = lm_head.weight
++        cache_key = (self.head_dtype, weight.device, weight.data_ptr(), weight._version)
++        cached_weight = getattr(lm_head, "_head_dtype_weight_cache", None)
++        if getattr(lm_head, "_head_dtype_weight_cache_key", None) != cache_key:
++            # 第一次遇到该权重时转一份 FP32 常驻显存，后续步骤直接复用
++            cached_weight = weight.detach().to(self.head_dtype)
++            lm_head._head_dtype_weight_cache = cached_weight
++            lm_head._head_dtype_weight_cache_key = cache_key
++
++        bias = None
++        if embedding_bias is not None:
++            bias_key = (
++                self.head_dtype,
++                embedding_bias.device,
++                embedding_bias.data_ptr(),
++                embedding_bias._version,
++            )
++            bias = getattr(lm_head, "_head_dtype_bias_cache", None)
++            if getattr(lm_head, "_head_dtype_bias_cache_key", None) != bias_key:
++                bias = embedding_bias.detach().to(self.head_dtype)
++                lm_head._head_dtype_bias_cache = bias
++                lm_head._head_dtype_bias_cache_key = bias_key
++
+         return F.linear(
+             hidden_states.to(self.head_dtype),
+-            lm_head.weight.to(self.head_dtype),
+-            embedding_bias.to(self.head_dtype) if embedding_bias is not None else None,
++            cached_weight,
++            bias,
+         )
+ 
+     def _get_logits(
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -109,17 +109,35 @@
+         # return int32 (while PyTorch argmax and topk return int64).
+         sampled = sampled.long()
+ 
++        # HOST-2: check if `sampled` is guaranteed argmax of `raw_logprobs` so rank is 1.
++        _holder = sampling_metadata.thinking_budget_state_holder
++        _logits_unmodified_before_sample = (
++            sampling_metadata.no_penalties
++            and not sampling_metadata.bad_words_token_ids
++            and sampling_metadata.allowed_token_ids_mask is None
++            and not sampling_metadata.logitsprocs.non_argmax_invariant
++            and (_holder is None or not _holder.has_tracked_requests())
++        )
++        _sampled_is_argmax = bool(
++            sampling_metadata.all_greedy
++            and (
++                logprobs_mode in ("processed_logprobs", "processed_logits")
++                or _logits_unmodified_before_sample
++            )
++        )
++
+         # Handle logprob_token_ids if specified (more efficient than full vocab)
+         # This is used by generative_scoring API to get logprobs for specific tokens
+-        logprob_token_ids_tensors = None
+         if sampling_metadata.logprob_token_ids:
+             assert raw_logprobs is not None
+-            logprob_token_ids_tensors = self.gather_specific_token_logprobs(
+-                raw_logprobs, sampling_metadata.logprob_token_ids, sampled
++            logprobs_tensors = self.gather_specific_token_logprobs(
++                raw_logprobs,
++                sampling_metadata.logprob_token_ids,
++                sampled,
++                is_argmax=_sampled_is_argmax,
+             )
+-
+-        if num_logprobs is None:
+-            logprobs_tensors = logprob_token_ids_tensors
++        elif num_logprobs is None:
++            logprobs_tensors = None
+         elif num_logprobs == -1:
+             # Return the full unsorted and unranked logprobs.
+             logprobs_tensors = LogprobsTensors(
+@@ -128,14 +146,12 @@
+         else:
+             # Gather the logprobs and ranks of the topk and sampled token.
+             logprobs_tensors = self.gather_logprobs(
+-                raw_logprobs, num_logprobs, token_ids=sampled
++                raw_logprobs,
++                num_logprobs,
++                token_ids=sampled,
++                is_argmax=_sampled_is_argmax,
+             )
+ 
+-        # If we have both num_logprobs and logprob_token_ids, prefer
+-        # logprob_token_ids as it's more specific
+-        if logprob_token_ids_tensors is not None and num_logprobs is not None:
+-            logprobs_tensors = logprob_token_ids_tensors
+-
+         # Use int32 to reduce the tensor size.
+         sampled = sampled.to(torch.int32)
+ 
+@@ -154,6 +170,7 @@
+         logprobs: torch.Tensor,
+         logprob_token_ids: dict[int, list[int]],
+         sampled: torch.Tensor,
++        is_argmax: bool = False,
+     ) -> LogprobsTensors | None:
+         """Gather logprobs for specific token IDs requested per request.
+ 
+@@ -212,12 +229,15 @@
+ 
+         # Compute ranks for the sampled token. log_softmax is monotonic w.r.t.
+         # the original logits, so ranks computed from logprobs are equivalent.
+-        sampled_logprobs = logprobs.gather(-1, sampled.unsqueeze(-1))
+-        # Avoid 0/1 specialization recompile on the batch dimension of the
+-        # compiled batched_count_greater_than. See gather_logprobs for context.
+-        torch._dynamo.decorators.mark_unbacked(logprobs, 0)
+-        torch._dynamo.decorators.mark_unbacked(sampled_logprobs, 0)
+-        token_ranks = batched_count_greater_than(logprobs, sampled_logprobs)
++        if is_argmax:
++            token_ranks = torch.ones((batch_size,), dtype=torch.int64, device=device)
++        else:
++            sampled_logprobs = logprobs.gather(-1, sampled.unsqueeze(-1))
++            # Avoid 0/1 specialization recompile on the batch dimension of the
++            # compiled batched_count_greater_than. See gather_logprobs for context.
++            torch._dynamo.decorators.mark_unbacked(logprobs, 0)
++            torch._dynamo.decorators.mark_unbacked(sampled_logprobs, 0)
++            token_ranks = batched_count_greater_than(logprobs, sampled_logprobs)
+ 
+         return LogprobsTensors(
+             logprob_token_ids=token_ids_tensor.to(torch.int32),
+@@ -311,6 +331,7 @@
+         logprobs: torch.Tensor,
+         num_logprobs: int,
+         token_ids: torch.Tensor,
++        is_argmax: bool = False,
+     ) -> LogprobsTensors:
+         """
+         Gather logprobs for topk and sampled/prompt token.
+@@ -343,10 +364,15 @@
+         # of the compiled batched_count_greater_than. mark_unbacked makes
+         # the size fully symbolic so dynamo doesn't specialize when
+         # batch_size transitions from 1 to >=2.
+-        with gpu_sync_allowed(first_only=True):
+-            torch._dynamo.decorators.mark_unbacked(logprobs, 0)
+-            torch._dynamo.decorators.mark_unbacked(token_logprobs, 0)
+-            token_ranks = batched_count_greater_than(logprobs, token_logprobs)
++        if is_argmax:
++            token_ranks = torch.ones(
++                (logprobs.shape[0],), dtype=torch.int64, device=logprobs.device
++            )
++        else:
++            with gpu_sync_allowed(first_only=True):
++                torch._dynamo.decorators.mark_unbacked(logprobs, 0)
++                torch._dynamo.decorators.mark_unbacked(token_logprobs, 0)
++                token_ranks = batched_count_greater_than(logprobs, token_logprobs)
+ 
+         # Concatenate together with the topk.
+         indices = torch.cat((token_ids, topk_indices), dim=1)
+--- a/vllm/v1/engine/__init__.py
++++ b/vllm/v1/engine/__init__.py
+@@ -295,6 +295,8 @@
+     EXECUTOR_FAILED = b"\x04"
+     # Sentinel to wake up input_queue.get() during shutdown.
+     WAKEUP = b"\x05"
++    # HOST-3: atomic batch request submission so multi-question requests land in one step.
++    ADD_BATCH = b"\x06"
+ 
+ 
+ class ReconfigureDistributedRequest(msgspec.Struct):
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -1541,6 +1541,11 @@
+             if self._reject_add_in_shutdown(req):
+                 return
+             self.add_request(req, request_wave)
++        elif request_type == EngineCoreRequestType.ADD_BATCH:
++            for req, request_wave in request:
++                if self._reject_add_in_shutdown(req):
++                    continue
++                self.add_request(req, request_wave)
+         elif request_type == EngineCoreRequestType.ABORT:
+             self.abort_requests(request)
+         elif request_type == EngineCoreRequestType.UTILITY:
+@@ -1696,6 +1701,9 @@
+         add_request_decoder = MsgpackDecoder(
+             EngineCoreRequest, oob_tensor_provider=self.tensor_ipc_receiver
+         )
++        add_requests_batch_decoder = MsgpackDecoder(
++            list[EngineCoreRequest], oob_tensor_provider=self.tensor_ipc_receiver
++        )
+         generic_decoder = MsgpackDecoder(oob_tensor_provider=self.tensor_ipc_receiver)
+ 
+         with ExitStack() as stack, zmq.Context() as ctx:
+@@ -1765,6 +1773,19 @@
+                         except Exception:
+                             self._handle_request_preproc_error(req)
+                             continue
++                    elif request_type == EngineCoreRequestType.ADD_BATCH:
++                        reqs: list[EngineCoreRequest] = add_requests_batch_decoder.decode(data_frames)
++                        prepared_batch = []
++                        for req in reqs:
++                            try:
++                                prepared_batch.append(self.preprocess_add_request(req))
++                            except MultiModalCacheMissError as e:
++                                self._handle_mm_cache_miss(req, e)
++                            except Exception:
++                                self._handle_request_preproc_error(req)
++                        if not prepared_batch:
++                            continue
++                        request = prepared_batch
+                     elif request_type == EngineCoreRequestType.UTILITY:
+                         request = generic_decoder.decode(data_frames)
+                         client_idx, call_id, method, args = request
+--- a/vllm/v1/engine/core_client.py
++++ b/vllm/v1/engine/core_client.py
+@@ -1221,6 +1221,14 @@
+         await self._send_input(EngineCoreRequestType.ADD, request)
+         self._ensure_output_queue_task()
+ 
++    async def add_requests_batch_async(self, requests: list[EngineCoreRequest]) -> None:
++        if not requests:
++            return
++        for req in requests:
++            req.client_index = self.client_index
++        await self._send_input(EngineCoreRequestType.ADD_BATCH, requests)
++        self._ensure_output_queue_task()
++
+     async def abort_requests_async(self, request_ids: list[str]) -> None:
+         if request_ids and not self.resources.engine_dead:
+             await self._send_input(EngineCoreRequestType.ABORT, request_ids)
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -504,6 +504,52 @@
+             )
+         return queue
+ 
++    async def add_requests_batch(
++        self,
++        items: list[dict[str, Any]],
++    ) -> list[RequestOutputCollector]:
++        """HOST-3: preprocess and atomically submit a batch of n=1 requests."""
++        if not hasattr(self.engine_core, "add_requests_batch_async"):
++            return [
++                await self.add_request(**it)
++                for it in items
++            ]
++        supported_tasks = await self.get_supported_tasks()
++        self._run_output_handler()
++        core_requests: list[EngineCoreRequest] = []
++        queues: list[RequestOutputCollector] = []
++        for it in items:
++            prompt = it["prompt"]
++            params = it["params"]
++            request_id = it["request_id"]
++            if isinstance(prompt, EngineCoreRequest):
++                req = prompt
++                prompt_text = None
++            else:
++                req = await self.input_processor.process_inputs_async(
++                    request_id,
++                    prompt,
++                    params,
++                    supported_tasks=supported_tasks,
++                    arrival_time=it.get("arrival_time"),
++                    lora_request=it.get("lora_request"),
++                    tokenization_kwargs=it.get("tokenization_kwargs"),
++                    trace_headers=it.get("trace_headers"),
++                    priority=it.get("priority", 0),
++                    data_parallel_rank=it.get("data_parallel_rank"),
++                    session_id=it.get("session_id"),
++                )
++                prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
++            self.input_processor.assign_request_id(req)
++            q = RequestOutputCollector(req.params.output_kind, req.request_id)
++            if not self.output_processor.has_request(req.request_id):
++                self.check_admission(request_id=req.request_id)
++            self.output_processor.add_request(req, prompt_text, None, 0, q)
++            core_requests.append(req)
++            queues.append(q)
++        await self.engine_core.add_requests_batch_async(core_requests)
++        return queues
++
+     async def _add_request(
+         self,
+         request: EngineCoreRequest,
+--- a/vllm/entrypoints/scale_out/token_in_token_out/serving.py
++++ b/vllm/entrypoints/scale_out/token_in_token_out/serving.py
+@@ -281,6 +281,165 @@
+             request, result_generator, request_id, model_name, request_metadata
+         )
+ 
++    async def serve_tokens_batch(
++        self,
++        requests_list: list[GenerateRequest],
++        raw_request: Request | None = None,
++    ) -> list[GenerateResponse | ErrorResponse]:
++        """HOST-3: preprocess all requests and submit atomically as one batch."""
++        if not requests_list:
++            return []
++        if len(requests_list) == 1 or not hasattr(self.engine_client, "add_requests_batch"):
++            return list(
++                await asyncio.gather(
++                    *(self.serve_tokens(req, None) for req in requests_list)
++                )
++            )
++        self._preflight()
++        trace_headers = (
++            None
++            if raw_request is None
++            else await self._get_trace_headers(raw_request.headers)
++        )
++        data_parallel_rank = self._get_data_parallel_rank(raw_request)
++        session_id = self._get_session_id_from_headers(raw_request)
++        max_num_seqs = self.engine_client.vllm_config.scheduler_config.max_num_seqs
++
++        prepared: list[tuple[GenerateRequest, str, str, RequestResponseMetadata, dict]] = []
++        for idx, request in enumerate(requests_list):
++            if request.stream:
++                return [self.create_error_response("Streaming is not supported on /inference/v1/generate_batch")]
++            error_check_ret = await self._check_model(request)
++            if error_check_ret is not None:
++                return [error_check_ret]
++            lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
++            model_name = self.models.model_name(lora_request)
++            base_id = self._base_request_id(None, request.request_id)
++            request_id = f"generate-tokens-b{idx}-{base_id}"
++            request_metadata = RequestResponseMetadata(request_id=request_id)
++            sampling_params = request.sampling_params
++            if sampling_params.n != 1:
++                return list(
++                    await asyncio.gather(
++                        *(self.serve_tokens(req, None) for req in requests_list)
++                    )
++                )
++            if sampling_params.n > max_num_seqs:
++                return [self.create_error_response(f"sampling_params.n exceeds max_num_seqs ({max_num_seqs}).")]
++            if request.content_parts:
++                tracker = AsyncMultiModalItemTracker(self.model_config)
++                mm_parser = tracker.create_parser()
++                for part in request.content_parts:
++                    ptype = part.get("type", "")
++                    url = part.get("url")
++                    uid = part.get("uuid")
++                    if ptype == "image_url":
++                        mm_parser.parse_image(url, uid)
++                    elif ptype == "audio_url":
++                        mm_parser.parse_audio(url, uid)
++                    elif ptype == "video_url":
++                        mm_parser.parse_video(url, uid)
++                mm_data, mm_uuids = await tracker.resolve_items()
++                prompt = TokensPrompt(prompt_token_ids=request.token_ids)
++                if request.cache_salt is not None:
++                    prompt["cache_salt"] = request.cache_salt
++                if mm_data:
++                    prompt["multi_modal_data"] = mm_data
++                if mm_uuids:
++                    prompt["multi_modal_uuids"] = mm_uuids
++                (engine_input,) = await self.online_renderer.renderer.render_cmpl_async([prompt])
++            elif features := request.features:
++                mm_placeholders = {
++                    modality: [PlaceholderRange(offset=p.offset, length=p.length) for p in ranges]
++                    for modality, ranges in features.mm_placeholders.items()
++                }
++                mm_kwargs = mm_kwargs_from_features(features)
++                engine_input = mm_input(
++                    prompt_token_ids=request.token_ids,
++                    mm_kwargs=MultiModalKwargsItems(mm_kwargs),
++                    mm_hashes=features.mm_hashes,
++                    mm_placeholders=mm_placeholders,
++                    cache_salt=request.cache_salt,
++                )
++            else:
++                (engine_input,) = await self.online_renderer.preprocess_completion(
++                    request,
++                    prompt_input=request.token_ids,
++                    prompt_embeds=None,
++                    skip_mm_cache=True,
++                )
++            request._response_mm_placeholders = (
++                placeholder_ranges_from_engine_input(engine_input)
++                if request.return_token_ids and not self.model_config.is_encoder_decoder
++                else None
++            )
++            if request.kv_transfer_params is not None:
++                extra = sampling_params.extra_args or {}
++                extra["kv_transfer_params"] = request.kv_transfer_params
++                sampling_params.extra_args = extra
++            if request.ec_transfer_params is not None:
++                extra = sampling_params.extra_args or {}
++                extra["ec_transfer_params"] = request.ec_transfer_params
++                sampling_params.extra_args = extra
++            if not request.is_sampling_param_provided("max_tokens"):
++                sampling_params.max_tokens = get_max_tokens(
++                    max_model_len=self.model_config.max_model_len,
++                    max_tokens=None,
++                    input_length=self._extract_prompt_len(engine_input),
++                    default_sampling_params=self.default_sampling_params,
++                    override_max_tokens=self.override_max_tokens,
++                )
++            if self.force_no_detokenize:
++                sampling_params.detokenize = False
++            sampling_params.output_kind = RequestOutputKind.FINAL_ONLY
++            prepared.append(
++                (
++                    request,
++                    request_id,
++                    model_name,
++                    request_metadata,
++                    {
++                        "request_id": request_id,
++                        "prompt": engine_input,
++                        "params": sampling_params,
++                        "lora_request": lora_request,
++                        "trace_headers": trace_headers,
++                        "priority": request.priority,
++                        "data_parallel_rank": data_parallel_rank,
++                        "session_id": session_id,
++                    },
++                )
++            )
++
++        queues = await self.engine_client.add_requests_batch([p[4] for p in prepared])
++        completed: set[str] = set()
++
++        async def _iter_q(q, req_id: str):
++            finished = False
++            while not finished:
++                out = q.get_nowait() or await q.get()
++                finished = out.finished
++                if finished:
++                    completed.add(req_id)
++                yield out
++
++        async def _collect(idx: int):
++            req, req_id, model_name, req_meta, _ = prepared[idx]
++            return await self.serve_tokens_full_generator(
++                req, _iter_q(queues[idx], req_id), req_id, model_name, req_meta
++            )
++
++        try:
++            return list(await asyncio.gather(*(_collect(i) for i in range(len(prepared)))))
++        except BaseException:
++            unfinished = [p[1] for p in prepared if p[1] not in completed]
++            if unfinished:
++                try:
++                    await self.engine_client.abort(unfinished)
++                except Exception:
++                    pass
++            raise
++
+     async def serve_tokens_full_generator(
+         self,
+         request: GenerateRequest,
+--- a/vllm/entrypoints/scale_out/token_in_token_out/api_router.py
++++ b/vllm/entrypoints/scale_out/token_in_token_out/api_router.py
+@@ -73,6 +73,30 @@
+     return StreamingResponse(content=generator, media_type="text/event-stream")
+ 
+ 
++@router.post(
++    "/inference/v1/generate_batch",
++    dependencies=[Depends(validate_json_request)],
++    responses={
++        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
++        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
++        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
++    },
++)
++@with_cancellation
++@load_aware_call
++async def generate_batch(requests_list: list[GenerateRequest], raw_request: Request):
++    handler = generate_tokens(raw_request)
++    if handler is None:
++        raise NotImplementedError("The model does not support generate tokens API")
++    results = await handler.serve_tokens_batch(requests_list, raw_request)
++    dumped = []
++    for res in results:
++        if isinstance(res, ErrorResponse):
++            return JSONResponse(content=res.model_dump(), status_code=res.error.code)
++        dumped.append(res.model_dump())
++    return JSONResponse(content={"results": dumped})
++
++
+ def attach_router(app: FastAPI):
+     if getattr(app.state.args, "tokens_only", False):
+ 

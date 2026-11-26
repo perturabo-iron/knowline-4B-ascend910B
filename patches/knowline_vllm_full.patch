@@ -1,0 +1,288 @@
+--- a/knowline_vllm.py
++++ b/knowline_vllm.py
+@@ -31,6 +31,7 @@
+ from pathlib import Path
+ 
+ import requests
++from requests.adapters import HTTPAdapter
+ 
+ CHUNK = 127  # label ids per request: MAX_LOGPROB_TOKEN_IDS (128) minus the repeated last id (see VLLM.score)
+ MIME = {"image": "image/png", "video": "video/mp4", "audio": "audio/wav"}
+@@ -63,33 +64,126 @@
+     def __init__(self, url, model, timeout=120):
+         from transformers import AutoTokenizer
+         self.url, self.timeout, self.http = url.rstrip("/"), timeout, requests.Session()
++        adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32)
++        self.http.mount("http://", adapter)
++        self.http.mount("https://", adapter)
+         self.tok, self.lock = AutoTokenizer.from_pretrained(model), threading.Lock()
++        # HOST-3 controls (env-tunable for A/B testing):
++        # - KNOWLINE_WARM_MIN_TOKENS: skip warm(prefix) when prefix_tokens < threshold
++        #   (Qwen3.5-4B default effective mamba_block_size is 640 tokens; shorter prefixes cache 0 blocks).
++        # - KNOWLINE_BATCH_SCORE: submit multi-question scores as one atomic /inference/v1/generate_batch call.
++        self.warm_min_tokens = int(os.getenv("KNOWLINE_WARM_MIN_TOKENS", "640"))
++        self.batch_score_enabled = os.getenv("KNOWLINE_BATCH_SCORE", "1") != "0"
++        self._batch_endpoint_available = self.batch_score_enabled
+ 
+-    def _post(self, text, media, sampling_params):
+-        with self.lock:  # one tokenizer shared by the scoring threads
+-            ids = self.tok.encode(text, add_special_tokens=False)
++    def _post_ids(self, ids, content_parts, sampling_params):
+         body = {"token_ids": ids, "sampling_params": sampling_params}
+-        if media:
+-            body["content_parts"] = [_content_part(m) for m in media]
++        if content_parts:
++            body["content_parts"] = content_parts
+         r = self.http.post(f"{self.url}/inference/v1/generate", json=body, timeout=self.timeout)
+         r.raise_for_status()
+         out = r.json()
+         return out["choices"][0], (out.get("usage") or {}).get("prompt_tokens", len(ids))
+ 
++    def _post(self, text, media, sampling_params):
++        with self.lock:  # one tokenizer shared by the scoring threads
++            ids = self.tok.encode(text, add_special_tokens=False)
++        content_parts = [_content_part(m) for m in media] if media else None
++        return self._post_ids(ids, content_parts, sampling_params)
++
+     def warm(self, prefix, media):
+-        self._post(prefix, media, {"max_tokens": 1, "temperature": 0.0})
++        with self.lock:
++            ids = self.tok.encode(prefix, add_special_tokens=False)
++        if not media and self.warm_min_tokens > 0 and len(ids) < self.warm_min_tokens:
++            # HOST-3: prefix shorter than one Mamba cache block caches 0 blocks; skip wasted step.
++            return
++        content_parts = [_content_part(m) for m in media] if media else None
++        self._post_ids(ids, content_parts, {"max_tokens": 1, "temperature": 0.0})
+ 
+     def score(self, text, media, ids):
+         got, n = {}, 0
++        with self.lock:
++            tok_ids = self.tok.encode(text, add_special_tokens=False)
++        content_parts = [_content_part(m) for m in media] if media else None
+         for k in range(0, len(ids), CHUNK):
+             part = ids[k:k + CHUNK]
+             # vLLM lists the sampled token first and keeps `logprobs` entries; with the last id repeated (one entry
+             # once deduplicated) every label still fits when the sampled token is not a label.
+-            choice, n = self._post(text, media, {"max_tokens": 1, "temperature": 0.0, "logprobs": len(part) + 1,
+-                                                 "logprob_token_ids": part + part[-1:]})
++            choice, n = self._post_ids(tok_ids, content_parts, {"max_tokens": 1, "temperature": 0.0,
++                                                                 "logprobs": len(part) + 1,
++                                                                 "logprob_token_ids": part + part[-1:]})
+             got.update((_token_id(t), t["logprob"]) for t in choice["logprobs"]["content"][0]["top_logprobs"])
+         return _finite([got.get(i) for i in ids]), n
+ 
++    def score_batch(self, items_prompts_and_ids, media):
++        """HOST-3: batch-tokenize all questions in one call and submit atomically to /inference/v1/generate_batch."""
++        texts = [p for p, _ in items_prompts_and_ids]
++        with self.lock:
++            all_tok_ids = self.tok(texts, add_special_tokens=False)["input_ids"]
++        content_parts = [_content_part(m) for m in media] if media else None
++        bodies = []
++        mapping = []  # (item_idx, label_chunk)
++        for item_idx, ((_, label_ids), tok_ids) in enumerate(zip(items_prompts_and_ids, all_tok_ids)):
++            for k in range(0, len(label_ids), CHUNK):
++                part = label_ids[k:k + CHUNK]
++                body = {
++                    "token_ids": tok_ids,
++                    "sampling_params": {
++                        "max_tokens": 1,
++                        "temperature": 0.0,
++                        "logprobs": len(part) + 1,
++                        "logprob_token_ids": part + part[-1:],
++                    },
++                }
++                if content_parts:
++                    body["content_parts"] = content_parts
++                bodies.append(body)
++                mapping.append((item_idx, len(tok_ids)))
++
++        if self._batch_endpoint_available and len(bodies) > 1:
++            r = self.http.post(f"{self.url}/inference/v1/generate_batch", json=bodies, timeout=self.timeout)
++            if r.status_code == 404:
++                self._batch_endpoint_available = False
++            else:
++                r.raise_for_status()
++                outs = r.json()["results"]
++                gots = [{} for _ in items_prompts_and_ids]
++                ns = [0] * len(items_prompts_and_ids)
++                for (item_idx, tok_len), out in zip(mapping, outs):
++                    choice = out["choices"][0]
++                    ns[item_idx] = (out.get("usage") or {}).get("prompt_tokens", tok_len)
++                    gots[item_idx].update(
++                        (_token_id(t), t["logprob"]) for t in choice["logprobs"]["content"][0]["top_logprobs"]
++                    )
++                return [
++                    (_finite([gots[i].get(lid) for lid in label_ids]), ns[i])
++                    for i, (_, label_ids) in enumerate(items_prompts_and_ids)
++                ]
++
++        # Fallback: concurrent pre-tokenized requests over keep-alive pool
++        from concurrent.futures import ThreadPoolExecutor
++
++        def _send_one(body_and_len):
++            body, tok_len = body_and_len
++            resp = self.http.post(f"{self.url}/inference/v1/generate", json=body, timeout=self.timeout)
++            resp.raise_for_status()
++            out = resp.json()
++            return out["choices"][0], (out.get("usage") or {}).get("prompt_tokens", tok_len)
++
++        with ThreadPoolExecutor(max_workers=min(16, len(bodies))) as ex:
++            outs = list(ex.map(_send_one, [(b, tl) for b, (_, tl) in zip(bodies, mapping)]))
++        gots = [{} for _ in items_prompts_and_ids]
++        ns = [0] * len(items_prompts_and_ids)
++        for (item_idx, _), (choice, n) in zip(mapping, outs):
++            ns[item_idx] = n
++            gots[item_idx].update(
++                (_token_id(t), t["logprob"]) for t in choice["logprobs"]["content"][0]["top_logprobs"]
++            )
++        return [
++            (_finite([gots[i].get(lid) for lid in label_ids]), ns[i])
++            for i, (_, label_ids) in enumerate(items_prompts_and_ids)
++        ]
++
+     def generate(self, text, media, max_new_tokens=32):
+         """Box: greedy decoding, the logprob of every output token (logprobs 0 = the sampled token's own), as SGLang's
+         /generate response with return_text_in_logprobs."""
+@@ -118,6 +212,39 @@
+     sys.path.insert(0, str(server_dir.resolve()))
+     import knowline_server as ks
+     ks.SGLang = lambda url, **kw: VLLM(url, a.model, a.backend_timeout)  # main() builds SGLang(a.url) for --backend sglang
++    # HOST-3: route multi-question KnowLine.run() through VLLM.score_batch() without modifying knowline_server.py.
++    _orig_knowline_run = ks.KnowLine.run
++
++    def _batched_knowline_run(self, state, questions):
++        if not (getattr(self.backend, "batch_score_enabled", False) and hasattr(self.backend, "score_batch") and len(questions) > 1):
++            return _orig_knowline_run(self, state, questions)
++        if not 1 <= len(questions) <= ks.MAX_QUESTIONS:
++            raise ValueError(f"1..{ks.MAX_QUESTIONS} questions, got {len(questions)}")
++        try:
++            if self.layout is None:
++                prefix, prompts, media = ks.render(self.processor, state, questions, self.labels)
++            else:
++                from knowline_layout import render_request
++                r = render_request({"state": state, "questions": questions}, self.processor, self.layout, labels=self.labels)
++                prefix, media = r["prefix"], r["media"]
++                prompts = {qid: r["prompts"][qid][0] for qid in questions}
++        except ValueError as exc:
++            if "criteria" in str(exc) or "options" in str(exc):
++                raise ValueError(f"{exc} (too many options per choice for this label set)") from exc
++            raise
++        items = list(prompts.items())
++        self.backend.warm(prefix, media)
++        results = self.backend.score_batch(
++            [(it[1][0], self.ids[:len(it[1][1])]) for it in items],
++            media,
++        )
++        answers = {
++            qid: ks.answer(questions[qid], keys, ks.softmax(row, self.T_by_type.get(questions[qid].get("type"), self.T)))
++            for (qid, (_, keys)), (row, _) in zip(items, results)
++        }
++        return answers, {"input_tokens": sum(n for _, n in results), "output_tokens": len(items)}
++
++    ks.KnowLine.run = _batched_knowline_run
+     sys.argv = [ks.__file__, *rest, "--model", a.model, "--url", a.url, "--backend", "sglang" if a.backend == "vllm" else "hf"]
+     if a.backend == "vllm":
+         print(f"knowline_vllm: {ks.__file__} with the vLLM backend at {a.url} (the line below says sglang)", flush=True)
+--- a/serve_knowline_vllm.sh
++++ b/serve_knowline_vllm.sh
+@@ -1,50 +1,83 @@
+ #!/bin/bash
+-# Serve a KnowLine model behind /v1/systemone on vLLM 0.30.0 (deployment; our submitted runs use SGLang: serve_knowline.sh).
++# Serve a KnowLine model behind /v1/systemone on optimized vLLM + vLLM-Ascend 0.30.0 (Ascend 910B4).
+ #   bash serve_knowline_vllm.sh <model dir> [gpus=0] [port=8080]
+ # Starts `vllm serve` (port = front-end port + 1000, bound to 127.0.0.1), then knowline_vllm.py: the model dir's own
+-# knowline_server.py with a vLLM backend. Both follow the model's serve_knowline.sh: FP8 at load where it uses FP8
+-# (35B-A3B, 4B), fp32 lm_head, served name m, and its knowline_server.py options (temperatures, header, box style, ...).
+-# gpus: one id, or ids with commas for tensor parallelism (0,1).
++# knowline_server.py with an optimized vLLM backend (atomic multi-question batching + smart warm skip).
++#
+ # Environment:
+-#   MEM (0.85)        --gpu-memory-utilization: sizes the KV cache, scores do not depend on it
+-#   MAXLEN (-1)       --max-model-len; -1 = the longest that fits in memory, up to the model's limit
+-#   QUANT (auto)      fp8 | bf16; auto = as serve_knowline.sh
+-#   SEQS (256)        --max-num-seqs; vLLM's default (1024 on large GPUs) can exceed the Mamba cache blocks of the
+-#                     Qwen3.5 models (GDN layers) and stop the start-up; each question is a one-token request
+-#   IMAGES (8)        images per request (--limit-mm-per-prompt); 0 = text only, no memory kept for the vision encoder
++#   MEM (0.85)        --gpu-memory-utilization
++#   MAXLEN (-1)       --max-model-len; -1 = longest that fits in memory
++#   QUANT (auto)      fp8 | bf16; auto defaults to bf16 on Ascend NPU (910B4 does not support native FP8)
++#   SEQS (256)        --max-num-seqs
++#   IMAGES (8)        images per request (--limit-mm-per-prompt)
+ #   HOST (127.0.0.1)  front-end bind address
+-#   VLLM (vllm), PYTHON (python): the vLLM CLI and the interpreter of the front end
+-#   VLLM_ARGS         more flags for vllm serve (e.g. --compilation-config, see README.md)
++#   VLLM (vllm), PYTHON (python): vLLM CLI and front-end interpreter
++#   VLLM_ARGS         extra flags for vllm serve (NOTE: no spaces inside JSON values!)
+ set -euo pipefail
+ MODEL=${1:?usage: serve_knowline_vllm.sh <model dir> [gpus] [port]}
+ GPUS=${2:-0}; PORT=${3:-8080}; VLLM_PORT=$((PORT + 1000)); MEM=${MEM:-0.85}; MAXLEN=${MAXLEN:--1}
+ QUANT=${QUANT:-auto}; SEQS=${SEQS:-256}; IMAGES=${IMAGES:-8}; HOST=${HOST:-127.0.0.1}; VLLM=${VLLM:-vllm}; PYTHON=${PYTHON:-python}
+ KIT=$(cd "$(dirname "$0")" && pwd); MODEL=$(cd "$MODEL" && pwd); SERVE="$MODEL/serve_knowline.sh"
+ [ -f "$SERVE" ] || { echo "no serve_knowline.sh in $MODEL" >&2; exit 1; }
+-# The front end: serve_knowline.sh's knowline_server.py command (through its last continued line), run by
+-# knowline_vllm.py on the same knowline_server.py, with vLLM as the backend.
++
+ FRONT=$(awk '/knowline_server.py" --model/ {on = 1} on {print; if ($0 !~ /\\$/) exit}' "$SERVE" |
+   sed -e 's|^python "$HERE/knowline_server.py"|"$PYTHON" "$KIT/knowline_vllm.py" --server-dir "$HERE"|' \
+       -e 's|--backend sglang|--backend vllm|')
+ case "$FRONT" in *knowline_vllm.py*"--backend vllm"*) ;; *) echo "no knowline_server.py command in $SERVE" >&2; exit 1 ;; esac
++
+ if [ "$QUANT" = auto ]; then
+-  if grep -q -- "--quantization fp8" "$SERVE"; then QUANT=fp8; else QUANT=bf16; fi
++  if command -v npu-smi >/dev/null 2>&1 || [ -d /usr/local/Ascend ]; then
++    QUANT=bf16
++    echo "[knowline-ascend] Ascend NPU detected: defaulting QUANT=bf16 (set QUANT=fp8 to override)" >&2
++  elif grep -q -- "--quantization fp8" "$SERVE"; then
++    QUANT=fp8
++  else
++    QUANT=bf16
++  fi
+ fi
++
+ ENGINE=(--served-model-name m --host 127.0.0.1 --port "$VLLM_PORT" --tensor-parallel-size "$(awk -F, '{print NF}' <<< "$GPUS")"
+   --gpu-memory-utilization "$MEM" --max-model-len "$MAXLEN" --max-num-seqs "$SEQS" --enable-scale-out --max-logprobs 128
+   --generation-config vllm --limit-mm-per-prompt "{\"image\": $IMAGES}")
+ [ "$QUANT" = fp8 ] && ENGINE+=(--quantization fp8)
+ grep -q -- "--enable-fp32-lm-head" "$SERVE" && ENGINE+=(--hf-overrides '{"head_dtype": "float32"}')
++
++# HOST-4: Ascend CANN runtime defaults (TASK_QUEUE_ENABLE=2 breaks ACLGraph capture; CPU_AFFINITY_CONF=1 conflicts with cpu_binding)
++export TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE:-1}
++export ACLNN_CACHE_LIMIT=${ACLNN_CACHE_LIMIT:-10000}
++export HOST_CACHE_CAPACITY=${HOST_CACHE_CAPACITY:-50}
++if [ "${TASK_QUEUE_ENABLE}" = "2" ]; then
++  echo "[WARN] TASK_QUEUE_ENABLE=2 is incompatible with ACLGraph capture on torch_npu 2.10; recommend TASK_QUEUE_ENABLE=1" >&2
++fi
++if [ "${CPU_AFFINITY_CONF:-}" = "1" ]; then
++  echo "[WARN] CPU_AFFINITY_CONF=1 conflicts with vllm_ascend cpu_binding and regresses latency" >&2
++fi
++
++# Full-stack KnowLine optimization defaults (all overridable via env vars)
++export VLLM_ASCEND_FP32_HEAD_MM=${VLLM_ASCEND_FP32_HEAD_MM:-1}
++export VLLM_ASCEND_GDN_CPP_GLUE=${VLLM_ASCEND_GDN_CPP_GLUE:-1}
++export VLLM_ASCEND_GDN_SKIP_UNUSED_FINAL_STATE=${VLLM_ASCEND_GDN_SKIP_UNUSED_FINAL_STATE:-1}
++export VLLM_ASCEND_GDN_GATING_IN_GRAPH=${VLLM_ASCEND_GDN_GATING_IN_GRAPH:-1}
++export VLLM_ASCEND_SHARE_MROPE_COS_SIN=${VLLM_ASCEND_SHARE_MROPE_COS_SIN:-1}
++export KNOWLINE_BATCH_SCORE=${KNOWLINE_BATCH_SCORE:-1}
++export KNOWLINE_WARM_MIN_TOKENS=${KNOWLINE_WARM_MIN_TOKENS:-640}
++export KNOWLINE_DEFAULT_CG_EXT=${KNOWLINE_DEFAULT_CG_EXT:-1}
++
++# HOST-3: extend Piecewise ACLGraph capture sizes up to 1024 so multi-question atomic batches (e.g. T=384, 644)
++# execute inside ACLGraph instead of falling back to Eager.
++if [ "${KNOWLINE_DEFAULT_CG_EXT}" != "0" ] && [[ " ${VLLM_ARGS:-} " != *" --compilation-config "* ]]; then
++  ENGINE+=(--compilation-config '{"cudagraph_capture_sizes":[1,2,4,8,16,24,32,48,64,96,128,160,192,200,256,320,384,448,512,576,656,768,896,1024]}')
++fi
++
+ # shellcheck disable=SC2086  # VLLM_ARGS is a list of flags
+ CUDA_VISIBLE_DEVICES=$GPUS "$VLLM" serve "$MODEL" "${ENGINE[@]}" ${VLLM_ARGS:-} &
+ VPID=$!; FPID=
+-# stop both servers on exit and on SIGTERM / SIGINT (docker stop, systemd), also while the front end runs
+ trap 'kill $FPID "$VPID" 2>/dev/null || true' EXIT
+ trap 'exit 143' TERM INT
+ until curl -sf -m 3 "http://127.0.0.1:$VLLM_PORT/health" > /dev/null; do
+   sleep 5; kill -0 "$VPID" 2>/dev/null || { echo "vLLM exited" >&2; exit 1; }
+ done
+-HERE=$MODEL; SGL_PORT=$VLLM_PORT  # the names serve_knowline.sh's command uses
++HERE=$MODEL; SGL_PORT=$VLLM_PORT
+ eval "exec $FRONT" &
+ FPID=$!
+ wait "$FPID"

@@ -1,0 +1,6 @@
+vllm==0.30.0
+vllm-ascend==0.30.0
+torch==2.10.0
+torch-npu==2.10.0.post7
+triton-ascend==3.6.0.post2
+flash-linear-attention-npu-a2==26.9.1
